@@ -1,4 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 
 namespace StoDialogueCapture;
@@ -8,12 +11,25 @@ internal sealed class ContactDialogReader
     private const int ContactDialogReadSize = 640;
     private const int MaxStringBytes = 64 * 1024;
     private const int MaxOptions = 128;
-    private const int ScanBlockSize = 1024 * 1024;
+    private const int ScanChunkSize = 4 * 1024 * 1024;
+    private const uint MemPrivate = 0x20000;
+    private const uint MemMapped = 0x40000;
 
+    // Heap allocators reuse the same neighborhoods, so a replacement
+    // ContactDialog and its strings normally land near the previous ones.
+    // Regions within this radius of any remembered address are scanned first.
+    private const ulong HotRegionRadius = 64UL * 1024 * 1024;
+
+    private static readonly int ScanParallelism = Math.Clamp(Environment.ProcessorCount, 1, 16);
     private static readonly int[] AnchorFieldOffsets = [0x08, 0x10, 0x18, 0x28, 0x30, 0x38];
 
     private readonly IMemoryReader _memory;
     private readonly List<MemoryRegion> _readableRegions;
+    private readonly List<ulong> _recentAddresses = [];
+
+    private readonly record struct AnchorSpec(string Value, bool AllowPrefix, string Kind);
+
+    private readonly record struct ScanChunk(ulong Address, int ReadLength, int ReportLength);
 
     public ContactDialogReader(IMemoryReader memory)
     {
@@ -25,11 +41,11 @@ internal sealed class ContactDialogReader
     public DiscoveryResult Discover(string anchor, Action<string>? progress = null)
     {
         return DiscoverCore(
-            anchor,
-            allowPrefix: false,
-            privateOnly: false,
+            [new AnchorSpec(anchor, AllowPrefix: false, "anchor")],
+            _readableRegions,
             requireLiveDialogue: false,
-            progress);
+            progress,
+            scanLabel: "all readable memory");
     }
 
     public DiscoveryResult? TryReacquire(
@@ -37,66 +53,93 @@ internal sealed class ContactDialogReader
         Action<string>? progress = null)
     {
         RefreshRegions();
-        var anchors = new List<(string Value, bool AllowPrefix, string Kind)>();
+        var anchors = new List<AnchorSpec>();
         if (!string.IsNullOrWhiteSpace(trigger.Speaker))
         {
-            anchors.Add((trigger.Speaker, false, "speaker"));
+            anchors.Add(new AnchorSpec(trigger.Speaker, AllowPrefix: false, "speaker"));
         }
         if (!string.IsNullOrWhiteSpace(trigger.Text))
         {
-            anchors.Add((trigger.Text, true, "spoken-text prefix"));
+            anchors.Add(new AnchorSpec(trigger.Text, AllowPrefix: true, "spoken-text prefix"));
+        }
+        var distinctAnchors = anchors
+            .DistinctBy(anchor => anchor.Value, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (distinctAnchors.Count == 0)
+        {
+            return null;
         }
 
-        foreach (var anchor in anchors.DistinctBy(item => item.Value, StringComparer.OrdinalIgnoreCase))
+        var privateRegions = _readableRegions
+            .Where(region => region.Type == MemPrivate)
+            .ToList();
+        var hotRegions = privateRegions.Where(IsHotRegion).ToList();
+        if (hotRegions.Count > 0 && hotRegions.Count < privateRegions.Count)
         {
             try
             {
-                progress?.Invoke($"Reacquiring ContactDialog from {anchor.Kind} '{anchor.Value}'...");
                 return DiscoverCore(
-                    anchor.Value,
-                    anchor.AllowPrefix,
-                    privateOnly: true,
+                    distinctAnchors,
+                    hotRegions,
                     requireLiveDialogue: true,
-                    progress);
+                    progress,
+                    scanLabel: "regions near the last dialogue");
             }
-            catch (InvalidOperationException exception)
+            catch (InvalidOperationException)
             {
-                progress?.Invoke($"Reacquisition anchor did not resolve: {exception.Message}");
+                progress?.Invoke(
+                    "No replacement near the last dialogue; scanning all private memory...");
             }
         }
-        return null;
+
+        try
+        {
+            return DiscoverCore(
+                distinctAnchors,
+                privateRegions,
+                requireLiveDialogue: true,
+                progress,
+                scanLabel: "all private memory");
+        }
+        catch (InvalidOperationException exception)
+        {
+            progress?.Invoke($"Reacquisition anchors did not resolve: {exception.Message}");
+            return null;
+        }
     }
 
     private DiscoveryResult DiscoverCore(
-        string anchor,
-        bool allowPrefix,
-        bool privateOnly,
+        IReadOnlyList<AnchorSpec> anchors,
+        IReadOnlyList<MemoryRegion> patternRegions,
         bool requireLiveDialogue,
-        Action<string>? progress)
+        Action<string>? progress,
+        string scanLabel)
     {
-        if (string.IsNullOrWhiteSpace(anchor))
+        if (anchors.Count == 0 || anchors.All(anchor => string.IsNullOrWhiteSpace(anchor.Value)))
         {
-            throw new ArgumentException("Anchor must contain visible dialogue text.", nameof(anchor));
+            throw new ArgumentException("Anchor must contain visible dialogue text.", nameof(anchors));
         }
 
-        progress?.Invoke($"Scanning {_readableRegions.Count:N0} readable regions for anchor '{anchor.Replace("'", "''")}'...");
-        var anchorAddresses = new HashSet<ulong>();
-        foreach (var pattern in BuildAnchorPatterns(anchor, allowPrefix))
-        {
-            foreach (var address in FindPattern(pattern, 128, privateOnly))
-            {
-                anchorAddresses.Add(address);
-            }
-        }
+        var stopwatch = Stopwatch.StartNew();
+        var patterns = anchors
+            .SelectMany(anchor => BuildAnchorPatterns(anchor.Value, anchor.AllowPrefix))
+            .ToList();
+        var scanBytes = patternRegions.Sum(region => (long)region.Size);
+        progress?.Invoke(
+            $"Scanning {patternRegions.Count:N0} region(s) ({scanBytes / (1024 * 1024):N0} MB, {scanLabel}) " +
+            $"for {patterns.Count} anchor pattern(s) on {ScanParallelism} core(s)...");
+        var anchorAddresses = FindPatterns(patterns, 256, patternRegions).ToHashSet();
         if (anchorAddresses.Count == 0)
         {
             throw new InvalidOperationException(
                 "The anchor text was not found in readable GameClient memory. Keep the dialogue open and use an exact visible header.");
         }
 
-        progress?.Invoke($"Found {anchorAddresses.Count:N0} anchor address(es); locating pointer references...");
+        progress?.Invoke(
+            $"Found {anchorAddresses.Count:N0} anchor address(es) in {stopwatch.ElapsedMilliseconds:N0} ms; " +
+            "locating pointer references...");
         var candidateAddresses = new HashSet<ulong>();
-        foreach (var reference in FindPointerReferences(anchorAddresses, 4096, privateOnly))
+        foreach (var reference in FindPointerReferences(anchorAddresses, 4096, patternRegions))
         {
             foreach (var offset in AnchorFieldOffsets)
             {
@@ -108,8 +151,9 @@ internal sealed class ContactDialogReader
         }
 
         progress?.Invoke($"Validating {candidateAddresses.Count:N0} candidate structure address(es)...");
+        var anchorValues = anchors.Select(anchor => anchor.Value).ToList();
         var candidates = candidateAddresses
-            .Select(address => TryReadDialog(address, anchor))
+            .Select(address => TryReadDialog(address, anchorValues))
             .Where(candidate => candidate != null)
             .Cast<DialogCandidate>()
             .Where(candidate => !requireLiveDialogue || IsCredibleLiveDialogue(candidate.Snapshot))
@@ -131,16 +175,20 @@ internal sealed class ContactDialogReader
         // The player/contact owner is heap-resident in the x64 client.  A map
         // transition can replace ContactDialog while updating a pointer in
         // that owner, so retaining only module-global references loses the
-        // conversation as soon as the map changes.
-        var pointerSlots = FindPointerReferences(best.Address, 4096)
-            .Distinct()
-            .ToList();
+        // conversation as soon as the map changes.  Mapped file regions are
+        // asset caches and cannot hold those live owner slots.
+        var pointerSlots = FindPointerReferences(
+            new HashSet<ulong> { best.Address },
+            4096,
+            PointerSlotRegions());
         var modulePointerSlotCount = pointerSlots.Count(address =>
             address >= _memory.MainModuleBase &&
             address < _memory.MainModuleBase + _memory.MainModuleSize);
 
+        RememberScanNeighborhood(best.Address, pointerSlots, anchorAddresses);
         progress?.Invoke(
-            $"Selected ContactDialog 0x{best.Address:X} (score {best.Score}); " +
+            $"Selected ContactDialog 0x{best.Address:X} (score {best.Score}) " +
+            $"in {stopwatch.ElapsedMilliseconds:N0} ms; " +
             $"following {pointerSlots.Count} pointer slot(s) " +
             $"({modulePointerSlotCount} in the main module).");
         return new DiscoveryResult(best, pointerSlots, anchorAddresses.Order().ToList());
@@ -154,14 +202,47 @@ internal sealed class ContactDialogReader
             _memory.Regions.Where(region => region.IsReadable).OrderBy(region => region.BaseAddress));
     }
 
+    private void RememberScanNeighborhood(
+        ulong dialogAddress,
+        IReadOnlyList<ulong> pointerSlots,
+        IEnumerable<ulong> anchorAddresses)
+    {
+        _recentAddresses.Clear();
+        _recentAddresses.Add(dialogAddress);
+        _recentAddresses.AddRange(pointerSlots.Take(64));
+        _recentAddresses.AddRange(anchorAddresses.Take(64));
+    }
+
+    private bool IsHotRegion(MemoryRegion region)
+    {
+        if (_recentAddresses.Count == 0)
+        {
+            return false;
+        }
+        var lower = region.BaseAddress >= HotRegionRadius ? region.BaseAddress - HotRegionRadius : 0;
+        var upper = region.EndAddress + HotRegionRadius;
+        foreach (var address in _recentAddresses)
+        {
+            if (address >= lower && address < upper)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<MemoryRegion> PointerSlotRegions() =>
+        _readableRegions.Where(region => region.Type != MemMapped).ToList();
+
     public DialogCandidate? TryReadBest(
         IEnumerable<ulong> addresses,
         string? requiredAnchor = null,
         bool requireLiveDialogue = false)
     {
+        var requiredAnchors = requiredAnchor == null ? null : new[] { requiredAnchor };
         return addresses
             .Distinct()
-            .Select(address => TryReadDialog(address, requiredAnchor))
+            .Select(address => TryReadDialog(address, requiredAnchors))
             .Where(candidate => candidate != null)
             .Cast<DialogCandidate>()
             .Where(candidate => !requireLiveDialogue || IsCredibleLiveDialogue(candidate.Snapshot))
@@ -203,7 +284,7 @@ internal sealed class ContactDialogReader
         return values;
     }
 
-    private DialogCandidate? TryReadDialog(ulong address, string? requiredAnchor)
+    private DialogCandidate? TryReadDialog(ulong address, IReadOnlyList<string>? requiredAnchors)
     {
         var data = new byte[ContactDialogReadSize];
         if (!TryReadExact(address, data))
@@ -243,8 +324,9 @@ internal sealed class ContactDialogReader
         {
             return null;
         }
-        if (requiredAnchor != null && !primaryStrings.Any(value =>
-                value.Contains(requiredAnchor, StringComparison.OrdinalIgnoreCase)))
+        if (requiredAnchors is { Count: > 0 } &&
+            !requiredAnchors.Any(anchor => primaryStrings.Any(value =>
+                value.Contains(anchor, StringComparison.OrdinalIgnoreCase))))
         {
             return null;
         }
@@ -256,12 +338,13 @@ internal sealed class ContactDialogReader
 
         var score = nonEmptyCount * 10;
         score += options.Count * 5;
-        if (requiredAnchor != null)
+        if (requiredAnchors is { Count: > 0 })
         {
-            score += string.Equals(contactDisplayName, requiredAnchor, StringComparison.OrdinalIgnoreCase) ? 300 :
-                string.Equals(dialogHeader, requiredAnchor, StringComparison.OrdinalIgnoreCase) ? 200 :
-                string.Equals(dialogHeader2, requiredAnchor, StringComparison.OrdinalIgnoreCase) ? 100 :
-                string.Equals(listHeader, requiredAnchor, StringComparison.OrdinalIgnoreCase) ? 75 : 50;
+            score += requiredAnchors.Max(anchor =>
+                string.Equals(contactDisplayName, anchor, StringComparison.OrdinalIgnoreCase) ? 300 :
+                string.Equals(dialogHeader, anchor, StringComparison.OrdinalIgnoreCase) ? 200 :
+                string.Equals(dialogHeader2, anchor, StringComparison.OrdinalIgnoreCase) ? 100 :
+                string.Equals(listHeader, anchor, StringComparison.OrdinalIgnoreCase) ? 75 : 50);
         }
         score += LooksLikeNaturalText(dialogHeader) ? 10 : 0;
         score += LooksLikeNaturalText(dialogText1) || LooksLikeNaturalText(dialogText2) ? 15 : 0;
@@ -404,125 +487,144 @@ internal sealed class ContactDialogReader
         return false;
     }
 
-    private IEnumerable<ulong> FindPointerReferences(
-        ulong pointer,
-        int maximumMatches,
-        bool privateOnly = false)
+    private static List<ScanChunk> BuildChunks(IReadOnlyList<MemoryRegion> regions, int overlap)
     {
-        return FindPointerReferences(new HashSet<ulong> { pointer }, maximumMatches, privateOnly);
+        var chunks = new List<ScanChunk>();
+        foreach (var region in regions)
+        {
+            ulong offset = 0;
+            while (offset < region.Size)
+            {
+                var report = (int)Math.Min((ulong)ScanChunkSize, region.Size - offset);
+                var read = (int)Math.Min((ulong)report + (ulong)overlap, region.Size - offset);
+                chunks.Add(new ScanChunk(region.BaseAddress + offset, read, report));
+                offset += (ulong)report;
+            }
+        }
+        return chunks;
     }
 
-    private IEnumerable<ulong> FindPointerReferences(
+    private List<ulong> FindPointerReferences(
         IReadOnlySet<ulong> pointers,
         int maximumMatches,
-        bool privateOnly)
+        IReadOnlyList<MemoryRegion> regions)
     {
         if (pointers.Count == 0)
         {
-            yield break;
+            return [];
         }
 
+        var chunks = BuildChunks(regions, 0);
+        var matches = new ConcurrentBag<ulong>();
         var found = 0;
-        const uint memPrivate = 0x20000;
-        foreach (var region in _readableRegions)
-        {
-            if (privateOnly && region.Type != memPrivate)
+        Parallel.ForEach(
+            chunks,
+            new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism },
+            (chunk, state) =>
             {
-                continue;
-            }
-
-            ulong regionOffset = 0;
-            while (regionOffset < region.Size)
-            {
-                var requested = (int)Math.Min((ulong)ScanBlockSize, region.Size - regionOffset);
-                var block = new byte[requested];
-                var blockAddress = region.BaseAddress + regionOffset;
-                if (!_memory.TryRead(blockAddress, block, 0, requested, out var read) || read < 8)
+                if (Volatile.Read(ref found) >= maximumMatches)
                 {
-                    regionOffset += (ulong)requested;
-                    continue;
+                    state.Stop();
+                    return;
                 }
-
-                var alignment = (int)((8 - (blockAddress & 7)) & 7);
-                for (var offset = alignment; offset <= read - 8; offset += 8)
+                var buffer = ArrayPool<byte>.Shared.Rent(chunk.ReadLength);
+                try
                 {
-                    var value = BinaryPrimitives.ReadUInt64LittleEndian(block.AsSpan(offset, 8));
-                    if (!pointers.Contains(value))
+                    if (!_memory.TryRead(chunk.Address, buffer, 0, chunk.ReadLength, out var read) || read < 8)
                     {
-                        continue;
+                        return;
                     }
-                    yield return blockAddress + (ulong)offset;
-                    found++;
-                    if (found >= maximumMatches)
+                    var alignment = (int)((8 - (chunk.Address & 7)) & 7);
+                    for (var offset = alignment; offset <= read - 8; offset += 8)
                     {
-                        yield break;
+                        var value = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(offset, 8));
+                        if (!pointers.Contains(value))
+                        {
+                            continue;
+                        }
+                        matches.Add(chunk.Address + (ulong)offset);
+                        if (Interlocked.Increment(ref found) >= maximumMatches)
+                        {
+                            state.Stop();
+                            return;
+                        }
                     }
                 }
-                regionOffset += (ulong)requested;
-            }
-        }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            });
+        return matches.Distinct().Order().ToList();
     }
 
-    private IEnumerable<ulong> FindPattern(
-        byte[] pattern,
+    private List<ulong> FindPatterns(
+        IReadOnlyList<byte[]> patterns,
         int maximumMatches,
-        bool privateOnly = false)
+        IReadOnlyList<MemoryRegion> regions)
     {
-        var found = 0;
-        var overlap = Math.Max(0, pattern.Length - 1);
-        foreach (var region in _readableRegions)
+        if (patterns.Count == 0)
         {
-            const uint memPrivate = 0x20000;
-            if (privateOnly && region.Type != memPrivate)
-            {
-                continue;
-            }
-            ulong regionOffset = 0;
-            var carry = Array.Empty<byte>();
-            while (regionOffset < region.Size)
-            {
-                var requested = (int)Math.Min((ulong)ScanBlockSize, region.Size - regionOffset);
-                var block = new byte[carry.Length + requested];
-                if (carry.Length > 0)
-                {
-                    Buffer.BlockCopy(carry, 0, block, 0, carry.Length);
-                }
-                if (!_memory.TryRead(region.BaseAddress + regionOffset, block, carry.Length, requested, out var read) || read <= 0)
-                {
-                    regionOffset += (ulong)requested;
-                    carry = Array.Empty<byte>();
-                    continue;
-                }
-
-                var length = carry.Length + read;
-                var searchStart = 0;
-                while (searchStart <= length - pattern.Length)
-                {
-                    var index = block.AsSpan(searchStart, length - searchStart).IndexOf(pattern);
-                    if (index < 0)
-                    {
-                        break;
-                    }
-                    index += searchStart;
-                    var address = region.BaseAddress + regionOffset - (ulong)carry.Length + (ulong)index;
-                    yield return address;
-                    found++;
-                    if (found >= maximumMatches)
-                    {
-                        yield break;
-                    }
-                    searchStart = index + 1;
-                }
-
-                var carryLength = Math.Min(overlap, length);
-                carry = block.AsSpan(length - carryLength, carryLength).ToArray();
-                regionOffset += (ulong)read;
-                if (read < requested)
-                {
-                    regionOffset += (ulong)(requested - read);
-                }
-            }
+            return [];
         }
+
+        var overlap = Math.Max(0, patterns.Max(pattern => pattern.Length) - 1);
+        var chunks = BuildChunks(regions, overlap);
+        var matches = new ConcurrentBag<ulong>();
+        var found = 0;
+        Parallel.ForEach(
+            chunks,
+            new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism },
+            (chunk, state) =>
+            {
+                if (Volatile.Read(ref found) >= maximumMatches)
+                {
+                    state.Stop();
+                    return;
+                }
+                var buffer = ArrayPool<byte>.Shared.Rent(chunk.ReadLength);
+                try
+                {
+                    if (!_memory.TryRead(chunk.Address, buffer, 0, chunk.ReadLength, out var read) || read <= 0)
+                    {
+                        return;
+                    }
+                    var span = buffer.AsSpan(0, Math.Min(read, chunk.ReadLength));
+                    foreach (var pattern in patterns)
+                    {
+                        if (pattern.Length == 0 || span.Length < pattern.Length)
+                        {
+                            continue;
+                        }
+                        var searchStart = 0;
+                        while (searchStart <= span.Length - pattern.Length)
+                        {
+                            var index = span[searchStart..].IndexOf(pattern);
+                            if (index < 0)
+                            {
+                                break;
+                            }
+                            index += searchStart;
+                            if (index >= chunk.ReportLength)
+                            {
+                                break;
+                            }
+                            matches.Add(chunk.Address + (ulong)index);
+                            if (Interlocked.Increment(ref found) >= maximumMatches)
+                            {
+                                state.Stop();
+                                return;
+                            }
+                            searchStart = index + 1;
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            });
+        return matches.Distinct().Order().ToList();
     }
 
     private static IEnumerable<byte[]> BuildAnchorPatterns(string anchor, bool allowPrefix)

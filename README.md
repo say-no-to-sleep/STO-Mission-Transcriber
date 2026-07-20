@@ -145,6 +145,19 @@ replacement. This prevents retained dialogue copies from alternating between
 false open/closed states. Anchor references are resolved in one batched aligned
 pointer scan rather than one whole-memory pass per string copy.
 
+Scans are chunked and run in parallel across CPU cores with pooled buffers.
+A reacquisition fuses the speaker and spoken-text anchors (UTF-8 and UTF-16
+forms) into a single pass instead of one whole-memory pass per anchor form.
+Because the client's allocator reuses the same heap neighborhoods, the scanner
+remembers where the previous dialogue, its strings, and its owner pointer slots
+lived and first scans only regions within 64 MB of those addresses, falling
+back to a full private-memory scan when the replacement is not nearby. The
+pointer-slot pass skips mapped file regions, which are asset caches and cannot
+hold live owner slots. Repeated identical `[NPC]` lines — bridge officer combat
+callouts such as `Laying down suppressing fire.` — are attempted as a
+reacquisition trigger at most once per closed dialogue, so ability spam during
+combat no longer queues repeated scans of the same text.
+
 By default it automatically follows
 the newest `Live\logs\GameClient\chat_*.log`, starting at the file's current end
 and following a replacement file if STO rotates it. Future
