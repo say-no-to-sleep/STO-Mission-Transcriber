@@ -73,11 +73,14 @@ internal sealed class MainForm : Form
     private readonly Button _startButton = CreatePrimaryButton("Start capture");
     private readonly Button _stopButton = CreateSecondaryButton("Stop and create transcript");
     private readonly Button _renderButton = CreateSecondaryButton("Render existing JSONL");
+    private readonly Button _overlayButton = CreateSecondaryButton("Overlay");
     private readonly Button _browseButton = CreateSecondaryButton("Browse...");
     private readonly Button _openTranscriptButton = CreateSecondaryButton("Open transcript");
     private readonly Button _openFolderButton = CreateSecondaryButton("Open output folder");
     private readonly System.Windows.Forms.Timer _readinessTimer = new() { Interval = 1500 };
 
+    private readonly GuiSettings _settings;
+    private OverlayForm? _overlay;
     private CancellationTokenSource? _captureCancellation;
     private Task<CaptureRunResult>? _captureTask;
     private string? _lastTranscriptPath;
@@ -86,6 +89,8 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
+        _settings = GuiSettings.Load(GuiSettings.DefaultPath());
+
         Text = "STO Dialogue Capture";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(860, 680);
@@ -100,6 +105,7 @@ internal sealed class MainForm : Form
         _startButton.Click += StartCaptureAsync;
         _stopButton.Click += (_, _) => StopCapture();
         _renderButton.Click += RenderExistingAsync;
+        _overlayButton.Click += ToggleOverlay;
         _browseButton.Click += BrowseOutput;
         _openTranscriptButton.Click += (_, _) => OpenPath(_lastTranscriptPath);
         _openFolderButton.Click += (_, _) => OpenOutputFolder();
@@ -107,6 +113,15 @@ internal sealed class MainForm : Form
         _readinessTimer.Tick += (_, _) => UpdateReadiness();
         _readinessTimer.Start();
         FormClosing += OnFormClosing;
+        FormClosed += (_, _) => _overlay?.Dispose();
+        Load += (_, _) =>
+        {
+            if (_settings.OverlayVisible)
+            {
+                EnsureOverlay();
+                _overlay!.Show();
+            }
+        };
         _showRawLogBox.CheckedChanged += (_, _) =>
         {
             _rawLogBox.Visible = _showRawLogBox.Checked;
@@ -263,6 +278,7 @@ internal sealed class MainForm : Form
         panel.Controls.Add(_startButton);
         panel.Controls.Add(_stopButton);
         panel.Controls.Add(_renderButton);
+        panel.Controls.Add(_overlayButton);
         return panel;
     }
 
@@ -472,6 +488,10 @@ internal sealed class MainForm : Form
                     new FeedSegment($"[{DateTime.Now:HH:mm:ss}] {update.Message}{Environment.NewLine}", FeedStyle.Muted),
                 });
             }
+            if (_overlay is { Visible: true })
+            {
+                _overlay.ApplyProgress(update);
+            }
         });
     }
 
@@ -505,6 +525,60 @@ internal sealed class MainForm : Form
         if (!capturing && _progressBar.Style == ProgressBarStyle.Marquee)
         {
             _progressBar.Style = ProgressBarStyle.Blocks;
+        }
+        if (_overlay != null)
+        {
+            if (capturing)
+            {
+                _overlay.CaptureStarted();
+            }
+            else
+            {
+                _overlay.CaptureStopped();
+            }
+        }
+    }
+
+    private void EnsureOverlay()
+    {
+        if (_overlay != null)
+        {
+            return;
+        }
+        _overlay = new OverlayForm(_settings);
+        _overlay.ExpandRequested += (_, _) =>
+        {
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        };
+        _overlay.Hidden += (_, _) =>
+        {
+            _settings.OverlayVisible = false;
+            _settings.Save(GuiSettings.DefaultPath());
+        };
+    }
+
+    private void ToggleOverlay(object? sender, EventArgs eventArgs)
+    {
+        EnsureOverlay();
+        if (_overlay!.Visible)
+        {
+            _overlay.Hide();
+            _settings.OverlayVisible = false;
+            _settings.Save(GuiSettings.DefaultPath());
+        }
+        else
+        {
+            _overlay.Show();
+            if (_captureTask is { IsCompleted: false })
+            {
+                // Opened mid-capture: start the elapsed timer now (measured
+                // from overlay open) instead of leaving it frozen at idle.
+                _overlay.CaptureStarted();
+            }
+            _settings.OverlayVisible = true;
+            _settings.Save(GuiSettings.DefaultPath());
         }
     }
 

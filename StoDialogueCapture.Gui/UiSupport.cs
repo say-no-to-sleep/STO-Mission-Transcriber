@@ -115,6 +115,7 @@ internal static class UiSelfTests
         Assert(buttons.Contains("Stop and create transcript"), "Stop capture button");
         Assert(buttons.Contains("Render existing JSONL"), "offline render button");
         Assert(buttons.Contains("Open transcript"), "open transcript button");
+        Assert(buttons.Contains("Overlay"), "overlay toggle button");
 
         var checkBoxes = Descendants<CheckBox>(form).Select(checkBox => checkBox.Text).ToHashSet();
         Assert(checkBoxes.Contains("Show raw log"), "show raw log checkbox");
@@ -123,6 +124,74 @@ internal static class UiSelfTests
         Assert(richTextBoxCount == 2, "two live activity text boxes");
 
         RunFeedFormatterSelfTests();
+        RunOverlaySelfTests();
+        RunGuiSettingsSelfTests();
+    }
+
+    private static void RunOverlaySelfTests()
+    {
+        var beacon = OverlayForm.BeaconFor(CaptureState.Capturing, null, false);
+        Assert(beacon.Text == "Idle - not capturing", "overlay beacon: not capturing");
+
+        beacon = OverlayForm.BeaconFor(CaptureState.Scanning, null, true);
+        Assert(beacon.Text.StartsWith("Scanning", StringComparison.Ordinal), "overlay beacon: scanning");
+
+        beacon = OverlayForm.BeaconFor(CaptureState.Capturing, "closed", true);
+        Assert(beacon.Text == "Waiting for next dialogue", "overlay beacon: closed");
+
+        beacon = OverlayForm.BeaconFor(CaptureState.Capturing, "dialogue", true);
+        Assert(beacon.Text.Contains("safe to click", StringComparison.Ordinal), "overlay beacon: dialogue locked");
+
+        beacon = OverlayForm.BeaconFor(CaptureState.Completed, null, true);
+        Assert(beacon.Text == "Capture complete", "overlay beacon: completed");
+
+        using var overlay = new OverlayForm(new GuiSettings());
+        Assert(overlay.TopMost, "overlay is always on top");
+        var elapsedLabels = Descendants<Label>(overlay).Where(label => label.Text == "00:00:00");
+        Assert(elapsedLabels.Any(), "overlay elapsed label starts at 00:00:00");
+    }
+
+    private static void RunGuiSettingsSelfTests()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"sto-gui-settings-test-{Guid.NewGuid():N}.json");
+        try
+        {
+            var settings = new GuiSettings
+            {
+                OverlayX = 123,
+                OverlayY = 456,
+                OverlayVisible = true,
+                AlwaysRenameToMissionTitle = true,
+            };
+            settings.Save(path);
+            var loaded = GuiSettings.Load(path);
+            Assert(loaded.OverlayX == 123, "settings round-trip OverlayX");
+            Assert(loaded.OverlayY == 456, "settings round-trip OverlayY");
+            Assert(loaded.OverlayVisible, "settings round-trip OverlayVisible");
+            Assert(loaded.AlwaysRenameToMissionTitle, "settings round-trip AlwaysRenameToMissionTitle");
+
+            var missingPath = Path.Combine(Path.GetTempPath(), $"sto-gui-settings-missing-{Guid.NewGuid():N}.json");
+            var defaults = GuiSettings.Load(missingPath);
+            Assert(defaults.OverlayX == null, "missing settings file yields default OverlayX");
+            Assert(!defaults.OverlayVisible, "missing settings file yields default OverlayVisible");
+
+            var corruptPath = Path.Combine(Path.GetTempPath(), $"sto-gui-settings-corrupt-{Guid.NewGuid():N}.json");
+            File.WriteAllText(corruptPath, "not json");
+            try
+            {
+                var corruptDefaults = GuiSettings.Load(corruptPath);
+                Assert(corruptDefaults.OverlayX == null, "corrupt settings file yields default OverlayX");
+                Assert(!corruptDefaults.OverlayVisible, "corrupt settings file yields default OverlayVisible");
+            }
+            finally
+            {
+                File.Delete(corruptPath);
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     private static void RunFeedFormatterSelfTests()

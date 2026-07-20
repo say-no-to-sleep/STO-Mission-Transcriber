@@ -6,17 +6,17 @@ Working checklist for StoDialogueCapture.Gui. Raw ideas came out of the
 
 ## Approved (build now)
 
-- [ ] **Compact always-on-top capture overlay**
-  - [ ] Pinned (`TopMost`) mini-window toggled from the main form; draggable
+- [x] **Compact always-on-top capture overlay**
+  - [x] Pinned (`TopMost`) mini-window toggled from the main form; draggable
         borderless card that survives next to the STO window
-  - [ ] Status beacon with plain-language states:
+  - [x] Status beacon with plain-language states:
         green "Dialogue locked — safe to click through",
         amber "Waiting for next dialogue", teal "Scanning...",
         gray "Idle / not capturing"
-  - [ ] "Last captured" line: speaker + first line of body + arrived-via choice
-  - [ ] Session counters: dialogue windows, choices/transitions, NPC lines,
+  - [x] "Last captured" line: speaker + first line of body + arrived-via choice
+  - [x] Session counters: dialogue windows, choices/transitions, NPC lines,
         objective snapshots; elapsed capture time
-  - [ ] Expand/collapse back to the full window; remember overlay position
+  - [x] Expand/collapse back to the full window; remember overlay position
 - [x] **Live capture feed (main window)**
   - [x] Pretty-printed feed of captured events: speaker, excerpt, choices with
         the selected one marked
