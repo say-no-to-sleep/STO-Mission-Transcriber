@@ -17,12 +17,12 @@ Working checklist for StoDialogueCapture.Gui. Raw ideas came out of the
   - [ ] Session counters: dialogue windows, choices/transitions, NPC lines,
         objective snapshots; elapsed capture time
   - [ ] Expand/collapse back to the full window; remember overlay position
-- [ ] **Live capture feed (main window)**
-  - [ ] Pretty-printed feed of captured events: speaker, excerpt, choices with
+- [x] **Live capture feed (main window)**
+  - [x] Pretty-printed feed of captured events: speaker, excerpt, choices with
         the selected one marked
-  - [ ] Color-coded by type: dialogue / mission update / NPC / progress /
+  - [x] Color-coded by type: dialogue / mission update / NPC / progress /
         reacquisition / error
-  - [ ] Raw progress-string log preserved behind a "Show raw log" toggle
+  - [x] Raw progress-string log preserved behind a "Show raw log" toggle
 - [ ] **Auto-name output from mission title**
   - [ ] Default output stays timestamped at start
   - [ ] On stop, read the mission title the renderer inferred and offer to

@@ -46,6 +46,24 @@ internal sealed class MainForm : Form
         Font = new Font("Cascadia Mono", 9F),
         DetectUrls = false,
     };
+    private readonly RichTextBox _rawLogBox = new()
+    {
+        Dock = DockStyle.Fill,
+        ReadOnly = true,
+        BackColor = Color.FromArgb(18, 24, 27),
+        ForeColor = Color.FromArgb(214, 235, 230),
+        BorderStyle = BorderStyle.None,
+        Font = new Font("Cascadia Mono", 9F),
+        DetectUrls = false,
+        Visible = false,
+    };
+    private readonly CheckBox _showRawLogBox = new()
+    {
+        Text = "Show raw log",
+        AutoSize = true,
+    };
+    private readonly Font _feedFont = new("Cascadia Mono", 9F);
+    private readonly Font _feedFontBold = new("Cascadia Mono", 9F, FontStyle.Bold);
     private readonly ProgressBar _progressBar = new()
     {
         Dock = DockStyle.Top,
@@ -89,12 +107,17 @@ internal sealed class MainForm : Form
         _readinessTimer.Tick += (_, _) => UpdateReadiness();
         _readinessTimer.Start();
         FormClosing += OnFormClosing;
+        _showRawLogBox.CheckedChanged += (_, _) =>
+        {
+            _rawLogBox.Visible = _showRawLogBox.Checked;
+            _logBox.Visible = !_showRawLogBox.Checked;
+        };
 
         _stopButton.Enabled = false;
         _openTranscriptButton.Enabled = false;
         _openFolderButton.Enabled = false;
         UpdateReadiness();
-        AppendLog("Ready. In STO, run /ChatLog 1 and open the mission's first dialogue.");
+        LogBoth("Ready. In STO, run /ChatLog 1 and open the mission's first dialogue.");
     }
 
     private Control BuildLayout()
@@ -256,9 +279,26 @@ internal sealed class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 7));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.Controls.Add(_captureStatus, 0, 0);
+
+        var headerRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+        };
+        headerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        headerRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _showRawLogBox.Anchor = AnchorStyles.Right;
+        headerRow.Controls.Add(_captureStatus, 0, 0);
+        headerRow.Controls.Add(_showRawLogBox, 1, 0);
+
+        var logPanel = new Panel { Dock = DockStyle.Fill };
+        logPanel.Controls.Add(_logBox);
+        logPanel.Controls.Add(_rawLogBox);
+
+        layout.Controls.Add(headerRow, 0, 0);
         layout.Controls.Add(_progressBar, 0, 1);
-        layout.Controls.Add(_logBox, 0, 2);
+        layout.Controls.Add(logPanel, 0, 2);
         group.Controls.Add(layout);
         return group;
     }
@@ -319,7 +359,7 @@ internal sealed class MainForm : Form
 
         _captureCancellation = new CancellationTokenSource();
         SetCapturing(true);
-        AppendLog($"Starting capture: {outputPath}");
+        LogBoth($"Starting capture: {outputPath}");
         _captureTask = Task.Run(() => CaptureSession.RunAsync(
             options,
             OnCaptureProgress,
@@ -335,7 +375,7 @@ internal sealed class MainForm : Form
             SetStatus("Capture complete — JSONL and transcript are ready.", CaptureState.Completed);
             if (result.Transcript != null)
             {
-                AppendLog(
+                LogBoth(
                     $"Transcript: {result.Transcript.DialogueCount} dialogue window(s), " +
                     $"{result.Transcript.MissionMessageCount} Mission message(s), " +
                     $"{result.Transcript.NpcMessageCount} standalone NPC message(s).");
@@ -344,7 +384,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception exception)
         {
-            AppendLog($"ERROR: {exception.Message}");
+            LogBoth($"ERROR: {exception.Message}");
             SetStatus("Capture failed — see the activity log.", CaptureState.Waiting);
             MessageBox.Show(this, exception.Message, "Capture failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -400,7 +440,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception exception)
         {
-            AppendLog($"ERROR: {exception.Message}");
+            LogBoth($"ERROR: {exception.Message}");
             SetStatus("Rendering failed — see the activity log.", CaptureState.Waiting);
             MessageBox.Show(this, exception.Message, "Rendering failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -420,6 +460,18 @@ internal sealed class MainForm : Form
         {
             SetStatus(update.Message, update.State);
             AppendLog(update.Message);
+            if (update.Activity != null)
+            {
+                AppendFeed(FeedFormatter.Format(update.Activity, DateTime.Now));
+            }
+            else if (update.State is CaptureState.Starting or CaptureState.Waiting or CaptureState.Rendering or CaptureState.Completed ||
+                     update.Message.StartsWith("ERROR", StringComparison.Ordinal))
+            {
+                AppendFeed(new[]
+                {
+                    new FeedSegment($"[{DateTime.Now:HH:mm:ss}] {update.Message}{Environment.NewLine}", FeedStyle.Muted),
+                });
+            }
         });
     }
 
@@ -565,10 +617,55 @@ internal sealed class MainForm : Form
 
     private void AppendLog(string message)
     {
-        _logBox.AppendText($"[{DateTime.Now:T}] {message}{Environment.NewLine}");
+        _rawLogBox.AppendText($"[{DateTime.Now:T}] {message}{Environment.NewLine}");
+        _rawLogBox.SelectionStart = _rawLogBox.TextLength;
+        _rawLogBox.ScrollToCaret();
+    }
+
+    private void AppendFeed(IReadOnlyList<FeedSegment> segments)
+    {
+        foreach (var segment in segments)
+        {
+            if (string.IsNullOrEmpty(segment.Text))
+            {
+                continue;
+            }
+            _logBox.SelectionStart = _logBox.TextLength;
+            _logBox.SelectionLength = 0;
+            _logBox.SelectionColor = FeedSegmentColor(segment.Style);
+            _logBox.SelectionFont = FeedSegmentFont(segment.Style);
+            _logBox.AppendText(segment.Text);
+        }
         _logBox.SelectionStart = _logBox.TextLength;
         _logBox.ScrollToCaret();
     }
+
+    private void LogBoth(string message)
+    {
+        AppendLog(message);
+        AppendFeed(new[]
+        {
+            new FeedSegment($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}", FeedStyle.Muted),
+        });
+    }
+
+    private Color FeedSegmentColor(FeedStyle style) => style switch
+    {
+        FeedStyle.Tag => Color.FromArgb(120, 144, 156),
+        FeedStyle.Speaker => Color.FromArgb(214, 235, 230),
+        FeedStyle.Body => Color.FromArgb(214, 235, 230),
+        FeedStyle.Choice => Color.FromArgb(144, 164, 174),
+        FeedStyle.ChoiceSelected => Color.FromArgb(77, 208, 196),
+        FeedStyle.Muted => Color.FromArgb(120, 134, 140),
+        _ => Color.FromArgb(214, 235, 230),
+    };
+
+    private Font FeedSegmentFont(FeedStyle style) => style switch
+    {
+        FeedStyle.Speaker => _feedFontBold,
+        FeedStyle.ChoiceSelected => _feedFontBold,
+        _ => _feedFont,
+    };
 
     private void OnFormClosing(object? sender, FormClosingEventArgs eventArgs)
     {
