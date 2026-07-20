@@ -154,6 +154,82 @@ internal static class SelfTests
         TestChatLogContinuationTailer();
         TestTranscriptRenderer();
         TestTranscriptMissionProgressCorrections();
+        TestCaptureActivity();
+    }
+
+    private static void TestCaptureActivity()
+    {
+        var progress = new CaptureProgress(CaptureState.Capturing, "hello");
+        Assert(progress.Activity == null, "capture progress activity defaults to null");
+
+        var longExcerpt = CaptureSession.Excerpt(
+            "Line one.\n\nLine two continues on and on. " + new string('x', 260));
+        Assert(longExcerpt.Length <= 121, "excerpt truncation length");
+        Assert(!longExcerpt.Contains('\n'), "excerpt strips newlines");
+
+        Assert(CaptureSession.Excerpt("") == string.Empty, "excerpt empty input");
+        Assert(CaptureSession.Excerpt("   ") == string.Empty, "excerpt whitespace input");
+
+        var snapshot = new ContactDialogSnapshot(
+            DateTimeOffset.UtcNow,
+            "dialogue",
+            "GameClient",
+            "0x0",
+            2,
+            "Tovan Khev",
+            "",
+            "We need allies if we're going to survive this.",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            [
+                new ContactDialogOptionSnapshot(
+                    "Mission.Accept",
+                    "Accept",
+                    "",
+                    0,
+                    false,
+                    "",
+                    "",
+                    false,
+                    0,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    ""),
+                new ContactDialogOptionSnapshot(
+                    "Mission.Blank",
+                    "  ",
+                    "",
+                    0,
+                    false,
+                    "",
+                    "",
+                    false,
+                    1,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    ""),
+            ]);
+        var counters = new CaptureCounters(1, 0, 0, 0, 0);
+        var activity = CaptureSession.BuildDialogueActivity(snapshot, "Continue", counters);
+        Assert(activity.Kind == "dialogue", "dialogue activity kind");
+        Assert(activity.Speaker == "Tovan Khev", "dialogue activity speaker");
+        Assert(activity.Excerpt == "We need allies if we're going to survive this.", "dialogue activity excerpt");
+        Assert(activity.Choices != null && activity.Choices.Count == 1, "dialogue activity choices");
+        Assert(activity.Choices![0] == "Accept", "dialogue activity choice text");
+        Assert(activity.ArrivedVia == "Continue", "dialogue activity arrived via");
+        Assert(activity.Counters == counters, "dialogue activity counters");
     }
 
     private static void TestChatLogContinuationTailer()

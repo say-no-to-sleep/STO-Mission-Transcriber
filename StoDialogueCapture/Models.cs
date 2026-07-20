@@ -97,3 +97,19 @@ internal sealed record MissionProgressSnapshot(
     int State,
     string StateName,
     IReadOnlyList<MissionObjectiveSnapshot> Objectives);
+
+internal sealed record CaptureCounters(
+    int Dialogues,
+    int Transitions,
+    int NpcLines,
+    int MissionMessages,
+    int ProgressSnapshots);
+
+internal sealed record CaptureActivity(
+    string Kind,
+    string? Speaker,
+    string? Excerpt,
+    IReadOnlyList<string>? Choices,
+    string? SelectedChoice,
+    string? ArrivedVia,
+    CaptureCounters Counters);
